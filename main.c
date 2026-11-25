@@ -428,7 +428,7 @@ static void setup(void) {
     channel_config_set_dreq(&c, DREQ_ADC);
 
     // ADS1115 SIDE SETUP
-    i2c_init(I2C_PORT, 400 * 1000);
+    i2c_init(I2C_PORT, 100 * 1000);
     gpio_init(I2C_ALRT);
     gpio_set_dir(I2C_ALRT, GPIO_IN);
     gpio_pull_up(I2C_ALRT);
