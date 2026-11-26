@@ -2,11 +2,13 @@ import json
 import math
 import time
 from collections import deque
+from pathlib import Path
 
 import numpy as np
 import serial
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
+from obspy import Trace, UTCDateTime
 
 
 PORT = "COM7"                  # Pico COM port (used only when TEST_DATA = False)
@@ -17,6 +19,12 @@ HISTORY_SECONDS = 2            # Waveform length shown (s)
 SPECTRUM_MAX_HZ = 1000         # Right edge of the spectrum; capped at half the sample rate
 SPECTROGRAM_SECONDS = 10       # Spectrogram length shown (s)
 SPECTROGRAM_ROWS = 100         # Frequency rows in the spectrogram; peaks are kept when rows are merged
+
+RECORD = True                  # True = also save every sample to a miniSEED file, one per sensor
+RECORD_SECONDS = 10            # Samples are written to the file in chunks of this length (s)
+RECORD_FOLDER = Path(__file__).parent / "recordings"
+LOCATIONS = {"adc": "00", "ads1115": "10"}   # miniSEED location code: tells the sensors apart
+CHANNEL = "DPZ"                # miniSEED channel name (P = geophone, Z = vertical); placeholder for now
 
 
 # Test signal for each sensor: sample rate, block size, FFT length, DC bias,
@@ -69,6 +77,9 @@ buffer = b""                   # Bytes of an unfinished line wait here
 
 # Window: 3 rows (waveform, spectrum, spectrogram) x one column per sensor.
 fig, axes = plt.subplots(3, len(SENSORS), figsize=(14, 9), squeeze=False)
+run_name = UTCDateTime().strftime("%Y%m%dT%H%M%SZ")   # Recording file names start with the UTC start time
+if RECORD:
+    RECORD_FOLDER.mkdir(exist_ok=True)
 sensors = {}
 for col, name in enumerate(SENSORS):
     ax_wave, ax_spec, ax_sgram = axes[:, col]
@@ -85,7 +96,10 @@ for col, name in enumerate(SENSORS):
     sensors[name] = {"rate": None, "fft_len": None, "idx": None, "val": None,
                      "spectrum": None, "history": None,
                      "ax_wave": ax_wave, "ax_spec": ax_spec, "ax_sgram": ax_sgram,
-                     "wave_line": wave_line, "spec_line": spec_line, "sgram_image": sgram_image}
+                     "wave_line": wave_line, "spec_line": spec_line, "sgram_image": sgram_image,
+                     # Recording: samples not yet written, UTC time of the first one, file
+                     "rec": [], "rec_start": None,
+                     "rec_path": RECORD_FOLDER / f"{run_name}_{name}.mseed"}
 fig.tight_layout()
 
 
@@ -99,6 +113,23 @@ def handle_config(s, msg):
     max_hz = min(SPECTRUM_MAX_HZ, s["rate"] / 2)
     s["ax_spec"].set(xlim=(0, max_hz), ylabel=msg.get("spectrum_units", "Counts peak"))
     s["ax_sgram"].set(ylim=(0, max_hz))
+
+
+# Append the sensor's waiting samples to its miniSEED file as one chunk.
+def write_chunk(s, name):
+    if not s["rec"]:
+        return
+    tr = Trace(data=np.array(s["rec"], dtype=np.int32))
+    tr.stats.network, tr.stats.station = "XX", "GEO1"   # XX = unregistered experiment
+    tr.stats.location, tr.stats.channel = LOCATIONS[name], CHANNEL
+    tr.stats.sampling_rate = s["rate"]
+    tr.stats.starttime = s["rec_start"]
+    with open(s["rec_path"], "ab") as f:   # "ab" = append; miniSEED files can be joined like this
+        tr.write(f, format="MSEED")
+    # The next chunk starts right after this one: count samples instead of reading
+    # the clock again, so the chunks join without tiny gaps or overlaps.
+    s["rec_start"] += len(s["rec"]) / s["rate"]
+    s["rec"] = []
 
 
 # Redraw one sensor's three plots from its stored data.
@@ -158,6 +189,12 @@ def update(_frame):
             first = msg["first_sample_index"]
             s["idx"].extend(range(first, first + len(msg["values"])))
             s["val"].extend(msg["values"])
+            if RECORD:
+                if s["rec_start"] is None:
+                    s["rec_start"] = UTCDateTime()   # PC clock read once: arrival of the first block
+                s["rec"].extend(msg["values"])
+                if len(s["rec"]) >= RECORD_SECONDS * s["rate"]:
+                    write_chunk(s, msg.get("sensor", "adc"))
         elif msg["type"] == "fft":
             s["spectrum"] = np.array(msg["values"])
             s["history"].append(s["spectrum"])
@@ -172,3 +209,8 @@ anim = FuncAnimation(fig, update, interval=100, cache_frame_data=False)   # Call
 plt.show()                     # Opens the window; returns when it is closed
 if port:
     port.close()
+if RECORD:
+    for name, s in sensors.items():
+        write_chunk(s, name)       # Save the last, shorter chunk
+        if s["rec_start"] is not None:
+            print("Recorded", s["rec_path"])
